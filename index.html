@@ -175,12 +175,9 @@ nav {
 }
 
 .hero-banner {
-  background: #8B4513;
-  border: 4px solid #5C2D06;
-  padding: 28px 48px 24px;
+  padding: 10px;
   display: inline-block;
-  box-shadow: 4px 4px 0 #3a1a00, inset 0 0 0 3px #a0522d;
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 .hero-banner h1 {
@@ -1396,6 +1393,115 @@ footer p {
     ctx.fillRect(x + s * 0.4, by + s * 0.4, s * 0.25, ps);
     // Dot
     ctx.fillRect(x + s * 0.43, by + s * 0.6, ps * 2, ps * 2);
+    return { x, y: by, w: s, h: s };
+  }
+
+  // ── Interactive Mario ──
+  let mario = { x: 100, y: 100, vx: 0, vy: 0, dir: 1, isGrounded: false };
+  const keys = { left: false, right: false, up: false };
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = true;
+    if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ') {
+      keys.up = true;
+      if (mario.isGrounded) { mario.vy = -12 * (scale * 0.5); mario.isGrounded = false; }
+      // Prevent scrolling down with space if on the hero section
+      if (e.key === ' ' && window.scrollY < H) e.preventDefault();
+    }
+  });
+  document.addEventListener('keyup', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+    if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ') keys.up = false;
+  });
+
+  function drawMarioChar(x, y, dir, isGrounded, t) {
+    const m = scale * 0.5 * 1.5; // Mario scale
+    ctx.save();
+    ctx.translate(Math.floor(x), Math.floor(y));
+    if (dir < 0) { ctx.scale(-1, 1); ctx.translate(-12 * m, 0); }
+    
+    // Jump / walk animation offset
+    let walkOffset = (!isGrounded) ? -2 * m : (Math.abs(mario.vx) > 0.5 && Math.floor(t / 100) % 2 === 0 ? -1 * m : 0);
+
+    // Hat (Red)
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(2*m, 0, 6*m, 2*m);
+    ctx.fillRect(1*m, 2*m, 9*m, 2*m);
+    // Face (Skin)
+    ctx.fillStyle = '#ffcc99';
+    ctx.fillRect(2*m, 4*m, 6*m, 4*m);
+    ctx.fillRect(8*m, 4*m, 2*m, 2*m); // Nose
+    // Hair / Eye / Mustache (Brown)
+    ctx.fillStyle = '#663300';
+    ctx.fillRect(2*m, 4*m, 2*m, 4*m); // Hair
+    ctx.fillRect(6*m, 4*m, 1*m, 2*m); // Eye
+    ctx.fillRect(7*m, 6*m, 4*m, 1*m); // Mustache
+    // Overalls (Blue)
+    ctx.fillStyle = '#0000ff';
+    ctx.fillRect(2*m, 8*m, 6*m, 4*m);
+    ctx.fillRect(4*m, 12*m, 2*m, 2*m);
+    // Shirt (Red)
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 8*m, 2*m, 3*m);
+    ctx.fillRect(8*m, 8*m, 3*m, 3*m);
+    // Hands (Skin)
+    ctx.fillStyle = '#ffcc99';
+    ctx.fillRect(0, 11*m, 2*m, 2*m);
+    ctx.fillRect(9*m, 11*m, 2*m, 2*m);
+    // Boots (Brown)
+    ctx.fillStyle = '#663300';
+    ctx.fillRect(1*m, 14*m + walkOffset, 3*m, 2*m);
+    ctx.fillRect(6*m, 14*m - walkOffset, 4*m, 2*m);
+
+    ctx.restore();
+  }
+
+  function updateMario(platforms) {
+    const mw = 12 * (scale * 0.5 * 1.5);
+    const mh = 16 * (scale * 0.5 * 1.5);
+    const speed = 4 * (scale * 0.5);
+    const gravity = 0.6 * (scale * 0.5);
+    const friction = 0.8;
+
+    if (keys.left) { mario.vx -= 1; mario.dir = -1; }
+    if (keys.right) { mario.vx += 1; mario.dir = 1; }
+    mario.vx *= friction;
+    
+    // Limit speed
+    if (mario.vx > speed) mario.vx = speed;
+    if (mario.vx < -speed) mario.vx = -speed;
+
+    mario.vy += gravity;
+
+    mario.x += mario.vx;
+    mario.y += mario.vy;
+
+    mario.isGrounded = false;
+    
+    // Screen bounds
+    if (mario.x < 0) { mario.x = 0; mario.vx = 0; }
+    if (mario.x + mw > W) { mario.x = W - mw; mario.vx = 0; }
+
+    // Platform collisions
+    for (let p of platforms) {
+      if (mario.x + mw > p.x && mario.x < p.x + p.w) {
+        // Falling onto platform
+        if (mario.vy > 0 && mario.y + mh >= p.y && mario.y + mh - mario.vy <= p.y + 10) {
+          mario.y = p.y - mh;
+          mario.vy = 0;
+          mario.isGrounded = true;
+        }
+        // Hitting platform from below
+        else if (mario.vy < 0 && mario.y <= p.y + p.h && mario.y - mario.vy >= p.y + p.h - 10) {
+          mario.y = p.y + p.h;
+          mario.vy = 0;
+        }
+      }
+    }
+    
+    drawMarioChar(mario.x, mario.y, mario.dir, mario.isGrounded, Date.now());
   }
 
   function draw() {
@@ -1406,14 +1512,33 @@ footer p {
     drawHills();
     drawGround();
 
-    // Question blocks floating
     const groundY = H * 0.78;
-    drawQuestionBlock(W * 0.18, groundY - 90 * scale * 0.5, t);
-    drawQuestionBlock(W * 0.82, groundY - 70 * scale * 0.5, t);
-    drawQuestionBlock(W * 0.65, groundY - 110 * scale * 0.5, t + 1000);
+    let platforms = [{ x: 0, y: groundY, w: W, h: H - groundY }]; // Ground
+
+    // Question blocks floating
+    platforms.push(drawQuestionBlock(W * 0.18, groundY - 90 * scale * 0.5, t));
+    platforms.push(drawQuestionBlock(W * 0.82, groundY - 70 * scale * 0.5, t));
+    platforms.push(drawQuestionBlock(W * 0.65, groundY - 110 * scale * 0.5, t + 1000));
+
+    // Get text banner rect for Mario to stand on
+    const banner = document.querySelector('.hero-banner');
+    if (banner) {
+      const bRect = banner.getBoundingClientRect();
+      const cRect = canvas.getBoundingClientRect();
+      const bx = bRect.left - cRect.left;
+      const by = bRect.top - cRect.top;
+      // Slightly reduce width to make it feel natural
+      platforms.push({ x: bx + 10, y: by + 10, w: bRect.width - 20, h: bRect.height - 20 });
+    }
+
+    updateMario(platforms);
 
     requestAnimationFrame(draw);
   }
+  
+  // Set initial mario pos
+  setTimeout(() => { mario.y = -50; mario.x = W * 0.5; }, 100);
+
   draw();
 })();
 
