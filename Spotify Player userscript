@@ -1,0 +1,720 @@
+// ==UserScript==
+// @name         Spotify Mini Player
+// @namespace    http://tampermonkey.net/
+// @version      5.0.0
+// @description  Spotify player on your GitHub Pages — Ctrl+M to toggle
+// @author       You
+// @match        https://shreyasjain2.github.io/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_xmlhttpRequest
+// @connect      accounts.spotify.com
+// @connect      api.spotify.com
+// @run-at       document-idle
+// ==/UserScript==
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESIGN DECISIONS
+// ─────────────────────────────────────────────────────────────────────────────
+// • @match is restricted to shreyasjain2.github.io/* — you control this page,
+//   so there is no hostile CSP. The script will always work here.
+//
+// • The Spotify Web Playback SDK runs in the REAL page context (not the
+//   Tampermonkey sandbox) via two injected <script> bridges:
+//     1. loadSDK()          — sets onSpotifyWebPlaybackSDKReady on true window
+//     2. injectPlayerBridge — creates Spotify.Player in true window context
+//   Communication back into the sandbox uses CustomEvents.
+//   This is exactly what your v4 script did; we keep and improve it.
+//
+// • PKCE OAuth with token refresh — no client secret needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+(async () => {
+  'use strict';
+
+// Get CLIENT_ID from spotify developer dashboard
+// add your own redirect url
+
+
+  const CLIENT_ID    = ''; 
+  const REDIRECT_URI = '';
+
+  const SCOPES = [
+    'streaming',
+    'user-read-email',
+    'user-read-private',
+    'user-read-playback-state',
+    'user-modify-playback-state',
+    'user-read-currently-playing',
+  ].join(' ');
+
+  // ── PKCE helpers ──────────────────────────────────────────────────────────
+
+  function generateRandomString(len) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const vals  = crypto.getRandomValues(new Uint8Array(len));
+    return vals.reduce((a, x) => a + chars[x % chars.length], '');
+  }
+  async function sha256(plain) {
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(plain));
+  }
+  function base64url(buf) {
+    return btoa(String.fromCharCode(...new Uint8Array(buf)))
+      .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  }
+
+  // ── Token storage ─────────────────────────────────────────────────────────
+
+  const saveTokens = d => {
+    GM_setValue('sp_access_token',  d.access_token);
+    GM_setValue('sp_refresh_token', d.refresh_token || GM_getValue('sp_refresh_token', ''));
+    GM_setValue('sp_token_expiry',  Date.now() + d.expires_in * 1000);
+  };
+  const getStoredToken  = () => GM_getValue('sp_access_token',  '');
+  const getRefreshToken = () => GM_getValue('sp_refresh_token', '');
+  const getTokenExpiry  = () => GM_getValue('sp_token_expiry',  0);
+  const isTokenExpired  = () => Date.now() > getTokenExpiry() - 60_000;
+  const clearTokens     = () => {
+    GM_deleteValue('sp_access_token');
+    GM_deleteValue('sp_refresh_token');
+    GM_deleteValue('sp_token_expiry');
+  };
+
+  // ── HTTP helpers ──────────────────────────────────────────────────────────
+
+  function gmPost(url, params) {
+    return new Promise((res, rej) => {
+      GM_xmlhttpRequest({
+        method:  'POST',
+        url,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        data:    new URLSearchParams(params).toString(),
+        onload:  r => {
+          const d = JSON.parse(r.responseText);
+          d.error ? rej(d) : res(d);
+        },
+        onerror: rej,
+      });
+    });
+  }
+
+  function apiReq(method, endpoint, body, token) {
+    return new Promise((res, rej) => {
+      GM_xmlhttpRequest({
+        method,
+        url:     `https://api.spotify.com/v1${endpoint}`,
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        data:    body ? JSON.stringify(body) : undefined,
+        onload:  r => {
+          try { res({ status: r.status, data: r.responseText ? JSON.parse(r.responseText) : null }); }
+          catch(e) { res({ status: r.status, data: null }); }
+        },
+        onerror: rej,
+      });
+    });
+  }
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+
+  async function startAuth() {
+    const verifier  = generateRandomString(64);
+    const challenge = base64url(await sha256(verifier));
+    const state     = generateRandomString(16);
+    GM_setValue('sp_code_verifier', verifier);
+    GM_setValue('sp_auth_state',    state);
+    const url = new URL('https://accounts.spotify.com/authorize');
+    url.search = new URLSearchParams({
+      response_type:         'code',
+      client_id:             CLIENT_ID,
+      scope:                 SCOPES,
+      redirect_uri:          REDIRECT_URI,
+      state,
+      code_challenge_method: 'S256',
+      code_challenge:        challenge,
+    }).toString();
+    window.location.href = url.toString();
+  }
+
+  async function exchangeCodeFromURL() {
+    const p     = new URLSearchParams(window.location.search);
+    const code  = p.get('code');
+    const state = p.get('state');
+    if (p.get('error'))                          return { success: false, message: 'Spotify denied: ' + p.get('error') };
+    if (!code)                                   return { success: false, message: 'No code in URL.' };
+    if (state !== GM_getValue('sp_auth_state','')) return { success: false, message: 'State mismatch.' };
+    const verifier = GM_getValue('sp_code_verifier','');
+    if (!verifier)                               return { success: false, message: 'No verifier stored.' };
+    try {
+      const d = await gmPost('https://accounts.spotify.com/api/token', {
+        grant_type:    'authorization_code',
+        code,
+        redirect_uri:  REDIRECT_URI,
+        client_id:     CLIENT_ID,
+        code_verifier: verifier,
+      });
+      saveTokens(d);
+      GM_deleteValue('sp_code_verifier');
+      GM_deleteValue('sp_auth_state');
+      return { success: true };
+    } catch(e) {
+      return { success: false, message: JSON.stringify(e) };
+    }
+  }
+
+  async function refreshAccessToken() {
+    const rt = getRefreshToken();
+    if (!rt) return false;
+    try {
+      saveTokens(await gmPost('https://accounts.spotify.com/api/token', {
+        grant_type:    'refresh_token',
+        refresh_token: rt,
+        client_id:     CLIENT_ID,
+      }));
+      return true;
+    } catch(e) {
+      clearTokens();
+      return false;
+    }
+  }
+
+  let _refreshPromise = null;
+  async function getToken() {
+    if (!isTokenExpired()) {
+      const t = getStoredToken();
+      if (t) return t;
+    }
+    if (!_refreshPromise) {
+      _refreshPromise = refreshAccessToken().finally(() => { _refreshPromise = null; });
+    }
+    return (await _refreshPromise) ? getStoredToken() : null;
+  }
+
+  // ── Spotify Web Playback SDK — real-page bridges ──────────────────────────
+  //
+  // Tampermonkey sandboxes its scripts. The SDK script runs on the real page
+  // and calls window.onSpotifyWebPlaybackSDKReady — which is the REAL window,
+  // not our sandbox window. Similarly, new Spotify.Player() must run in the
+  // real page context because window.Spotify lives there.
+  //
+  // Solution: inject lightweight <script> tags that execute synchronously in
+  // the real page context, then communicate back via CustomEvents which cross
+  // the sandbox boundary correctly.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  function loadSDK() {
+    return new Promise(resolve => {
+      window.addEventListener('sp_sdk_ready', resolve, { once: true });
+
+      // Bridge #1: sets the callback on the TRUE window so the SDK can fire it.
+      const bridge = document.createElement('script');
+      bridge.textContent = `
+        (function () {
+          if (window.Spotify && window.Spotify.Player) {
+            window.dispatchEvent(new CustomEvent('sp_sdk_ready'));
+            return;
+          }
+          window.onSpotifyWebPlaybackSDKReady = function () {
+            window.dispatchEvent(new CustomEvent('sp_sdk_ready'));
+          };
+        })();
+      `;
+      document.head.appendChild(bridge);
+      bridge.remove();
+
+      // Load the actual SDK (idempotent — won't add twice).
+      if (!document.querySelector('script[src*="spotify-player.js"]')) {
+        const sdk = document.createElement('script');
+        sdk.src = 'https://sdk.scdn.co/spotify-player.js';
+        document.head.appendChild(sdk);
+      }
+    });
+  }
+
+  function injectPlayerBridge(initialToken) {
+    return new Promise(resolve => {
+      window.addEventListener('sp_player_ready', e => {
+        deviceId = e.detail.device_id;
+        resolve(deviceId);
+      }, { once: true });
+
+      window.addEventListener('sp_state_changed', e => {
+        playerState = e.detail;
+        if (e.detail) {
+          updatePlayerUI(e.detail);
+          if (!e.detail.paused) startProgressPolling();
+          else { stopProgressPolling(); tickProgressUI(e.detail); }
+        } else {
+          stopProgressPolling();
+        }
+      });
+
+      window.addEventListener('sp_player_error', e => {
+        console.error('[Spotify] Player error:', e.detail.type, e.detail.message);
+        if (e.detail.type === 'account_error')      showStatus('⚠️ Spotify Premium required for browser playback.');
+        else if (e.detail.type === 'authentication_error') showStatus('⚠️ Auth error — hold ✕ 1 s to logout & re-login.');
+      });
+
+      window.addEventListener('sp_current_state', e => {
+        const cb = pendingStateCallbacks.shift();
+        if (cb) cb(e.detail);
+      });
+
+      // Bridge #2: lives in the real page context, owns the Spotify.Player instance.
+      // All control messages arrive as 'sp_cmd' CustomEvents.
+      // Token refresh requests are answered from our sandbox via 'sp_token_response_*'.
+      const escaped = initialToken.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const script  = document.createElement('script');
+      script.id     = 'sp-player-bridge';
+      script.textContent = `
+        (function () {
+          if (window._spBridgeActive) return;
+          window._spBridgeActive = true;
+
+          var _player = null;
+
+          function createPlayer(token) {
+            _player = new Spotify.Player({
+              name: 'Browser Mini Player',
+              getOAuthToken: function (cb) {
+                var reqId = 'tok_' + Date.now();
+                window.dispatchEvent(new CustomEvent('sp_need_token', { detail: { reqId: reqId } }));
+                window.addEventListener('sp_token_response_' + reqId, function h(e) {
+                  window.removeEventListener('sp_token_response_' + reqId, h);
+                  cb(e.detail.token);
+                });
+              },
+              volume: 0.5,
+            });
+
+            _player.addListener('ready',   function (e) {
+              window.dispatchEvent(new CustomEvent('sp_player_ready', { detail: { device_id: e.device_id } }));
+            });
+            _player.addListener('not_ready', function () {
+              window.dispatchEvent(new CustomEvent('sp_player_ready', { detail: { device_id: null } }));
+            });
+            _player.addListener('player_state_changed', function (state) {
+              window.dispatchEvent(new CustomEvent('sp_state_changed', {
+                detail: state ? JSON.parse(JSON.stringify(state)) : null
+              }));
+            });
+            _player.addListener('account_error',        function (e) {
+              window.dispatchEvent(new CustomEvent('sp_player_error', { detail: { type: 'account_error',        message: e.message } }));
+            });
+            _player.addListener('authentication_error', function (e) {
+              window.dispatchEvent(new CustomEvent('sp_player_error', { detail: { type: 'authentication_error', message: e.message } }));
+            });
+            _player.addListener('initialization_error', function (e) {
+              window.dispatchEvent(new CustomEvent('sp_player_error', { detail: { type: 'initialization_error', message: e.message } }));
+            });
+
+            _player.connect();
+          }
+
+          window.addEventListener('sp_cmd', function (e) {
+            if (!_player) return;
+            var cmd = e.detail.cmd, arg = e.detail.arg;
+            if      (cmd === 'togglePlay')  _player.togglePlay();
+            else if (cmd === 'next')        _player.nextTrack();
+            else if (cmd === 'prev')        _player.previousTrack();
+            else if (cmd === 'volume')      _player.setVolume(arg / 100);
+            else if (cmd === 'seek')        _player.seek(arg);
+            else if (cmd === 'disconnect')  _player.disconnect();
+            else if (cmd === 'getState') {
+              _player.getCurrentState().then(function (state) {
+                window.dispatchEvent(new CustomEvent('sp_current_state', {
+                  detail: state ? JSON.parse(JSON.stringify(state)) : null
+                }));
+              });
+            }
+          });
+
+          createPlayer('${escaped}');
+        })();
+      `;
+      document.head.appendChild(script);
+      script.remove();
+    });
+  }
+
+  // Answer token requests from the real-page bridge back into the sandbox.
+  window.addEventListener('sp_need_token', async e => {
+    const token = await getToken();
+    window.dispatchEvent(new CustomEvent('sp_token_response_' + e.detail.reqId, {
+      detail: { token: token || '' },
+    }));
+  });
+
+  // ── SDK state & controls ──────────────────────────────────────────────────
+
+  let deviceId    = null;
+  let playerState = null;
+
+  const pendingStateCallbacks = [];
+
+  const sdkCmd       = (cmd, arg) => window.dispatchEvent(new CustomEvent('sp_cmd', { detail: { cmd, arg } }));
+  const sdkTogglePlay = ()        => sdkCmd('togglePlay');
+  const sdkNext       = ()        => sdkCmd('next');
+  const sdkPrev       = ()        => sdkCmd('prev');
+  const sdkVolume     = pct       => sdkCmd('volume', pct);
+  const sdkSeek       = ms        => sdkCmd('seek', ms);
+  const sdkDisconnect = ()        => sdkCmd('disconnect');
+  const sdkGetState   = ()        => new Promise(resolve => {
+    pendingStateCallbacks.push(resolve);
+    sdkCmd('getState');
+  });
+
+  // ── Progress polling ──────────────────────────────────────────────────────
+
+  let progressInterval = null;
+
+  function startProgressPolling() {
+    if (progressInterval) return;
+    progressInterval = setInterval(async () => {
+      const state = await sdkGetState();
+      if (state) { playerState = state; tickProgressUI(state); }
+    }, 500);
+  }
+
+  function stopProgressPolling() {
+    if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
+  }
+
+  function tickProgressUI(state) {
+    const host = document.getElementById('sp-mini-player-host');
+    if (!host || !state?.track_window?.current_track) return;
+    const s = host.shadowRoot;
+    s.querySelector('#elapsed').textContent       = fmt(state.position);
+    s.querySelector('#dur').textContent           = fmt(state.duration);
+    s.querySelector('#prog-fill').style.width     = state.duration
+      ? Math.round((state.position / state.duration) * 100) + '%' : '0%';
+  }
+
+  async function transferPlayback(id) {
+    const token = await getToken();
+    if (!token || !id) return;
+    await apiReq('PUT', '/me/player', { device_ids: [id], play: false }, token);
+  }
+
+  // ── Callback page (shown at REDIRECT_URI after Spotify login) ────────────
+
+  function showCallbackPage() {
+    document.body.innerHTML = '';
+    Object.assign(document.body.style, {
+      background: '#121212', display: 'flex', alignItems: 'center',
+      justifyContent: 'center', height: '100vh', margin: '0',
+      fontFamily: '-apple-system,sans-serif', color: '#fff',
+    });
+    const box  = document.createElement('div');
+    box.style.textAlign = 'center';
+    const logo = document.createElement('div');
+    logo.textContent = '🎵'; logo.style.cssText = 'font-size:48px;margin-bottom:16px';
+    const h2 = document.createElement('h2');
+    h2.textContent = 'Spotify Mini Player'; h2.style.margin = '0 0 8px';
+    const p  = document.createElement('p');
+    p.textContent = 'Spotify redirected here. Click below to finish login.';
+    p.style.cssText = 'color:#b3b3b3;font-size:14px;margin:0 0 24px';
+    const btn = document.createElement('button');
+    btn.textContent = 'Complete Login';
+    btn.style.cssText = 'background:#1DB954;border:none;color:#fff;padding:14px 32px;border-radius:30px;font-size:16px;font-weight:700;cursor:pointer';
+    const msg = document.createElement('div');
+    msg.style.cssText = 'margin-top:16px;font-size:13px;color:#b3b3b3;min-height:20px';
+    const err = document.createElement('div');
+    err.style.cssText = 'margin-top:12px;font-size:12px;color:#e74c3c';
+    btn.addEventListener('click', async () => {
+      msg.textContent = 'Exchanging token…'; err.textContent = '';
+      const result = await exchangeCodeFromURL();
+      if (result.success) {
+        msg.textContent = '✅ Done! Close this tab and go back to browsing.';
+        btn.style.display = 'none';
+      } else {
+        msg.textContent = '❌ Failed.'; err.textContent = result.message;
+      }
+    });
+    box.append(logo, h2, p, btn, msg, err);
+    document.body.appendChild(box);
+  }
+
+  // ── Tiny DOM builder ──────────────────────────────────────────────────────
+
+  function mk(tag, props = {}) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) {
+      if      (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+      else if (k === 'cls')  el.className   = v;
+      else if (k === 'txt')  el.textContent = v;
+      else el.setAttribute(k, v);
+    }
+    return el;
+  }
+
+  // ── Player UI ─────────────────────────────────────────────────────────────
+
+  function buildPlayerUI() {
+    if (document.getElementById('sp-mini-player-host')) return null;
+
+    const host = mk('div', { id: 'sp-mini-player-host', style: {
+      position: 'fixed', bottom: '20px', right: '20px',
+      zIndex: '2147483647', width: '280px', display: 'none',
+    }});
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+
+    const style = document.createElement('style');
+    style.textContent = `
+      :host {
+        display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+        font-size:13px;color:#fff;background:#121212;border-radius:12px;
+        box-shadow:0 8px 32px rgba(0,0,0,.6);overflow:hidden;user-select:none;
+      }
+      * { box-sizing:border-box; }
+      #hdr {
+        display:flex;align-items:center;justify-content:space-between;
+        padding:8px 12px;background:#1DB954;cursor:move;
+      }
+      #hdr-title { font-weight:700;font-size:12px;letter-spacing:.5px; }
+      #hdr-btns  { display:flex;gap:4px; }
+      #hdr-btns button {
+        background:rgba(0,0,0,.2);border:none;color:#fff;cursor:pointer;
+        font-size:13px;width:22px;height:22px;border-radius:50%;
+        display:flex;align-items:center;justify-content:center;
+      }
+      #hdr-btns button:hover { background:rgba(0,0,0,.4); }
+      #body { padding:12px; }
+      #art    { width:100%;height:140px;object-fit:cover;border-radius:8px;margin-bottom:10px;display:none; }
+      #art-ph { width:100%;height:140px;background:#282828;border-radius:8px;
+                margin-bottom:10px;display:flex;align-items:center;justify-content:center;font-size:40px; }
+      #track  { font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+      #artist { color:#b3b3b3;font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+      #prog-bar  { margin:10px 0 4px;height:4px;background:#535353;border-radius:2px;overflow:hidden;cursor:pointer; }
+      #prog-fill { height:100%;background:#1DB954;width:0%;transition:width .4s linear; }
+      #time { display:flex;justify-content:space-between;color:#b3b3b3;font-size:10px;margin-bottom:10px; }
+      #controls { display:flex;align-items:center;justify-content:center;gap:16px; }
+      .btn { background:none;border:none;color:#fff;cursor:pointer;font-size:20px;padding:4px;line-height:1;transition:color .15s; }
+      .btn:hover { color:#1DB954; }
+      #btn-play { font-size:28px; }
+      #volume { margin-top:10px;display:flex;align-items:center;gap:8px;color:#b3b3b3;font-size:11px; }
+      #vol-slider { flex:1;accent-color:#1DB954;cursor:pointer; }
+      #auth-area  { padding:16px;text-align:center; }
+      #auth-area p { color:#b3b3b3;font-size:12px;margin:0 0 12px; }
+      #login-btn  { background:#1DB954;border:none;color:#fff;padding:8px 20px;
+                    border-radius:20px;font-size:13px;font-weight:700;cursor:pointer; }
+      #login-btn:hover { background:#1ed760; }
+      #status { padding:6px 12px 10px;font-size:11px;color:#b3b3b3;text-align:center;display:none; }
+      #sdk-status  { font-size:10px;color:#1DB954;text-align:center;padding:2px 0 6px;display:none; }
+      #sdk-loading { font-size:10px;color:#b3b3b3;text-align:center;padding:2px 0 6px; }
+    `;
+    shadow.appendChild(style);
+
+    // Header
+    const btnMin   = mk('button', { id: 'btn-min',   txt: '—', title: 'Minimise' });
+    const btnClose = mk('button', { id: 'btn-close', txt: '✕', title: 'Close (hold 1 s to logout)' });
+    const hdrBtns  = mk('div', { id: 'hdr-btns' }); hdrBtns.append(btnMin, btnClose);
+    const hdr      = mk('div', { id: 'hdr' });
+    hdr.append(mk('span', { id: 'hdr-title', txt: '🎵 Spotify' }), hdrBtns);
+
+    // Auth area
+    const loginBtn = mk('button', { id: 'login-btn', txt: 'Login with Spotify' });
+    const authArea = mk('div',    { id: 'auth-area' });
+    authArea.append(mk('p', { txt: 'Connect your Spotify account.' }), loginBtn);
+
+    // Player body
+    const art     = mk('img',  { id: 'art', src: '', alt: '' });
+    const artPh   = mk('div',  { id: 'art-ph', txt: '🎵' });
+    const track   = mk('div',  { id: 'track',  txt: 'Nothing playing' });
+    const artist  = mk('div',  { id: 'artist', txt: '—' });
+    const pFill   = mk('div',  { id: 'prog-fill' });
+    const pBar    = mk('div',  { id: 'prog-bar' }); pBar.appendChild(pFill);
+    const elapsed = mk('span', { id: 'elapsed', txt: '0:00' });
+    const dur     = mk('span', { id: 'dur',     txt: '0:00' });
+    const timeRow = mk('div',  { id: 'time' }); timeRow.append(elapsed, dur);
+    const btnPrev = mk('button', { cls: 'btn', id: 'btn-prev', txt: '⏮' });
+    const btnPlay = mk('button', { cls: 'btn', id: 'btn-play', txt: '▶' });
+    const btnNext = mk('button', { cls: 'btn', id: 'btn-next', txt: '⏭' });
+    const ctrls   = mk('div', { id: 'controls' }); ctrls.append(btnPrev, btnPlay, btnNext);
+    const volSlid = mk('input', { type: 'range', id: 'vol-slider', min: '0', max: '100', value: '50' });
+    const volVal  = mk('span', { id: 'vol-val', txt: '50' });
+    const volRow  = mk('div',  { id: 'volume' });
+    volRow.append(mk('span', { txt: '🔈' }), volSlid, volVal);
+    const sdkLoad = mk('div', { id: 'sdk-loading', txt: '⏳ Connecting browser player…' });
+    const sdkSt   = mk('div', { id: 'sdk-status',  txt: '🟢 Browser player active' });
+    const bodyEl  = mk('div', { id: 'body' });
+    bodyEl.append(art, artPh, track, artist, pBar, timeRow, ctrls, volRow, sdkLoad, sdkSt);
+    const playerArea = mk('div', { id: 'player-area' }); playerArea.append(bodyEl);
+    const statusEl   = mk('div', { id: 'status' });
+    const main       = mk('div', { id: 'main' });
+    main.append(authArea, playerArea, statusEl);
+    authArea.style.display = 'none'; playerArea.style.display = 'none';
+    shadow.append(hdr, main);
+
+    // ── Drag ──
+    let drag = false, ox = 0, oy = 0;
+    hdr.addEventListener('mousedown', e => {
+      if (e.target.tagName === 'BUTTON') return;
+      drag = true;
+      const r = host.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+    });
+    document.addEventListener('mousemove', e => {
+      if (!drag) return;
+      host.style.right = 'auto'; host.style.bottom = 'auto';
+      host.style.left  = (e.clientX - ox) + 'px';
+      host.style.top   = (e.clientY - oy) + 'px';
+    });
+    document.addEventListener('mouseup', () => { drag = false; });
+
+    // ── Minimise ──
+    btnMin.addEventListener('click', () => {
+      main.style.display = main.style.display === 'none' ? '' : 'none';
+    });
+
+    // ── Close (short) / Logout (long 1 s) ──
+    let closeTimer = null, longPressFired = false;
+    btnClose.addEventListener('mousedown', () => {
+      longPressFired = false;
+      closeTimer = setTimeout(() => {
+        longPressFired = true;
+        clearTokens(); stopProgressPolling(); sdkDisconnect(); host.remove();
+        uiBuilt = false; sdkStarted = false; visible = false; ui = null;
+      }, 1000);
+    });
+    btnClose.addEventListener('mouseup', () => { clearTimeout(closeTimer); closeTimer = null; });
+    btnClose.addEventListener('click', () => {
+      if (!longPressFired) {
+        stopProgressPolling(); sdkDisconnect(); host.remove();
+        uiBuilt = false; sdkStarted = false; visible = false; ui = null;
+      }
+    });
+
+    // ── Controls ──
+    btnPlay.addEventListener('click', sdkTogglePlay);
+    btnNext.addEventListener('click', sdkNext);
+    btnPrev.addEventListener('click', sdkPrev);
+
+    pBar.addEventListener('click', async e => {
+      const state = await sdkGetState();
+      if (!state) return;
+      sdkSeek(Math.floor((e.offsetX / pBar.offsetWidth) * state.duration));
+    });
+
+    let volTimer;
+    volSlid.addEventListener('input', () => {
+      volVal.textContent = volSlid.value;
+      clearTimeout(volTimer);
+      volTimer = setTimeout(() => sdkVolume(+volSlid.value), 200);
+    });
+
+    return {
+      querySelector: s  => shadow.querySelector(s),
+      showAuth:      ()  => { authArea.style.display = '';    playerArea.style.display = 'none'; },
+      showPlayer:    ()  => { authArea.style.display = 'none'; playerArea.style.display = ''; },
+      showSDKReady:  ()  => { sdkLoad.style.display = 'none'; sdkSt.style.display = ''; },
+      showSDKError:  msg => { sdkLoad.textContent = '⚠️ ' + msg; },
+    };
+  }
+
+  // ── UI update helpers ─────────────────────────────────────────────────────
+
+  function fmt(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  function updatePlayerUI(state) {
+    const host = document.getElementById('sp-mini-player-host');
+    if (!host) return;
+    const s = host.shadowRoot;
+    if (!state?.track_window?.current_track) {
+      s.querySelector('#track').textContent    = 'Nothing playing';
+      s.querySelector('#artist').textContent   = '—';
+      s.querySelector('#btn-play').textContent = '▶';
+      s.querySelector('#prog-fill').style.width = '0%';
+      return;
+    }
+    const t = state.track_window.current_track;
+    s.querySelector('#track').textContent    = t.name;
+    s.querySelector('#artist').textContent   = t.artists.map(a => a.name).join(', ');
+    s.querySelector('#btn-play').textContent = state.paused ? '▶' : '⏸';
+    s.querySelector('#elapsed').textContent  = fmt(state.position);
+    s.querySelector('#dur').textContent      = fmt(state.duration);
+    s.querySelector('#prog-fill').style.width = state.duration
+      ? Math.round((state.position / state.duration) * 100) + '%' : '0%';
+    const artUrl = t.album?.images?.[0]?.url;
+    const artEl  = s.querySelector('#art');
+    const artPh  = s.querySelector('#art-ph');
+    if (artUrl) { artEl.src = artUrl; artEl.style.display = ''; artPh.style.display = 'none'; }
+    else        { artEl.style.display = 'none'; artPh.style.display = ''; }
+  }
+
+  function showStatus(msg) {
+    const host = document.getElementById('sp-mini-player-host');
+    if (!host) return;
+    const el = host.shadowRoot.querySelector('#status');
+    if (!el) return;
+    el.textContent = msg; el.style.display = msg ? '' : 'none';
+  }
+
+  // ── Entry point ───────────────────────────────────────────────────────────
+
+  // Handle the OAuth callback redirect.
+  if (window.location.href.startsWith(REDIRECT_URI) &&
+      window.location.search.includes('code=')) {
+    showCallbackPage();
+    return;
+  }
+
+  // Guard: only run on http/https pages.
+  if (!window.location.href.startsWith('http')) return;
+
+  let uiBuilt = false, sdkStarted = false, visible = false, ui = null;
+
+  async function openPlayer() {
+    if (!uiBuilt) {
+      uiBuilt = true;
+      ui = buildPlayerUI();
+      if (!ui) return;
+
+      const token = await getToken();
+      if (!token) {
+        ui.showAuth();
+        ui.querySelector('#login-btn').addEventListener('click', startAuth);
+      } else {
+        ui.showPlayer();
+        if (!sdkStarted) {
+          sdkStarted = true;
+          try {
+            await loadSDK();                          // wait for real-page SDK ready event
+            const did = await injectPlayerBridge(token); // create Spotify.Player in real page
+            if (did) {
+              await transferPlayback(did);
+              ui.showSDKReady();
+              startProgressPolling();
+            } else {
+              ui.showSDKError('Device not ready. Reload and try again.');
+            }
+          } catch(e) {
+            console.error('[Spotify] SDK init failed', e);
+            ui.showSDKError('SDK failed. Try reloading.');
+          }
+        }
+      }
+    }
+
+    const host = document.getElementById('sp-mini-player-host');
+    if (!host) return;
+    visible = !visible;
+    host.style.display = visible ? '' : 'none';
+  }
+
+
+
+  window.addEventListener('keydown', e => {
+    if (e.ctrlKey && e.key === 'm') { e.preventDefault(); openPlayer(); }
+  });
+
+  window.addEventListener('spotify-egg-cracked', () => {
+    openPlayer();
+  });
+
+})();
